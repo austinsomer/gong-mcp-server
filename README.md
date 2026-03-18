@@ -1,67 +1,68 @@
 # Gong MCP Server
 
-A local MCP (Model Context Protocol) server that connects Claude Desktop to your Gong instance. Pull call transcripts by account name, list calls, and export full transcripts to files, all through natural conversation in Claude.
+A local MCP (Model Context Protocol) server that connects Claude to your Gong instance. Pull call transcripts by account name, list calls, and export full transcripts to files — all through natural conversation.
 
-## What It Does
+Works with both **Claude Code** and **Claude Desktop**.
 
-This server gives Claude access to six Gong tools:
+---
 
-- **gong_list_calls** - List calls in a date range with basic metadata
-- **gong_get_call** - Get detailed metadata for a specific call
-- **gong_get_transcripts** - Pull transcripts for specific calls (subject to 25K character response limit)
-- **gong_list_calls_extensive** - List calls with full participant and CRM context
-- **gong_get_account_transcripts** - Find and return transcripts for a specific account (subject to 25K character response limit)
-- **gong_export_account_transcripts** - Find and export full, untruncated transcripts for a specific account to markdown files on your computer
+## Available Tools
 
-The export tool is the primary workflow tool. It scans all calls in a date range, matches them to an account by CRM data, call title, or participant email, then writes complete transcripts to `~/Documents/Transcripts/{account_name}/`.
+| Tool | Description |
+|------|-------------|
+| `gong_list_calls` | List calls in a date range with basic metadata (ID, title, time, duration) |
+| `gong_get_call` | Get detailed metadata for a specific call (participants, CRM context, media info) |
+| `gong_get_transcripts` | Pull transcripts for specific call IDs (subject to 25K character response limit) |
+| `gong_list_calls_extensive` | List calls with full participant details, interaction stats, and CRM context |
+| `gong_get_account_transcripts` | Find and return transcripts for a specific account (subject to 25K character response limit) |
+| `gong_export_account_transcripts` | Export full, untruncated transcripts for an account to markdown files on disk |
+
+The **export tool** is the primary workflow tool. It scans all calls in a date range, matches them to an account, and writes complete transcripts to `~/Documents/Transcripts/{account_name}/`.
 
 ## Account Matching
 
 The server matches calls to accounts using a three-tier approach:
 
-1. **CRM Account** - Matches against HubSpot/Salesforce account name or website in Gong's CRM context
-2. **Call Title** - Matches the account name against the call title (e.g., "Rocketlane <> Tracelink" matches "tracelink")
-3. **Participant Email/Company** - Matches against participant email domains or company names
+1. **CRM Account** — matches against HubSpot/Salesforce account name or website in Gong's CRM context
+2. **Call Title** — matches the account filter against the call title (e.g., "Acme <> YourCompany" matches "acme")
+3. **Participant Email/Company** — matches against participant email domains or company names
 
-All matching is case-insensitive. You can use a company name ("Tracelink"), domain ("tracelink.com"), or partial match ("notion").
+All matching is case-insensitive. You can use a company name (`"Acme"`), domain (`"acme.com"`), or partial match (`"acme"`).
 
 ## Output Structure
 
-When using the export tool, transcripts are saved to:
+Exported transcripts are saved as:
 
 ```
 ~/Documents/Transcripts/
-  └── {account_name}/
-      ├── 2026-03-02_Call_Title_Here.md
-      ├── 2026-03-10_Another_Call.md
-      └── _combined_transcripts.md
+  +-- {account_name}/
+      |-- 2026-03-02_Call_Title_Here.md
+      |-- 2026-03-10_Another_Call.md
+      +-- _combined_transcripts.md
 ```
 
-Each file includes call metadata (date, duration, participants, Gong link) and the full speaker-labeled transcript. The combined file contains all transcripts in a single document.
+Each file includes call metadata (date, duration, participants, Gong link) followed by the full speaker-labeled transcript. The combined file contains all transcripts in one document.
 
 ## Requirements
 
 - Python 3.10+
-- Claude Desktop (with MCP support)
-- Gong API credentials (Access Key + Secret)
+- Claude Code or Claude Desktop
+- Gong API credentials (Access Key + Access Key Secret) with scopes:
+  - `api:calls:read:basic`
+  - `api:calls:read:extensive`
+  - `api:calls:read:transcript`
 
-## Files
+## Setup
 
-- `gong_mcp.py` - The MCP server
-- `requirements.txt` - Python dependencies
-- `claude_desktop_config.json` - Template config for Claude Desktop
-- `gong.env` - Where to store your Gong API credentials (not committed to version control)
-- `install-instructions.md` - Step-by-step setup guide (can be used with Claude Cowork for guided installation)
+See **[install-process.md](install-process.md)** for the full step-by-step guide. That doc is written so a Claude Code instance can follow it to set up the server on your machine.
 
-## Quick Start
+**Quick version:**
 
-See `install-instructions.md` for the full setup walkthrough. The short version:
-
-1. Copy files to `~/Documents/MCP/`
-2. Create a Python virtual environment and install dependencies
-3. Add your Gong API credentials to `claude_desktop_config.json`
-4. Merge the config into Claude Desktop's config file
-5. Restart Claude Desktop
+1. Copy `gong_mcp.py` and `requirements.txt` to `~/Documents/MCP/`
+2. Create a Python venv and install dependencies
+3. Get your Gong API credentials from your Gong admin
+4. Create `.mcp.json` (Claude Code) or update `claude_desktop_config.json` (Claude Desktop)
+5. Restart Claude
 
 ## Usage Examples
 
@@ -71,6 +72,17 @@ Once installed, just ask Claude naturally:
 - "Export all Notion call transcripts from February"
 - "List all calls from last week"
 - "Get the transcript for call ID 1234567890"
+- "Show me details for all calls with example.com participants"
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `gong_mcp.py` | The MCP server (main script) |
+| `requirements.txt` | Python dependencies |
+| `claude_desktop_config.template.json` | Template config for Claude Desktop |
+| `install-process.md` | Step-by-step setup guide (Claude Code-friendly) |
+| `.mcp.json` | Claude Code MCP config (created during setup, contains credentials) |
 
 ## Rate Limits
 
@@ -78,7 +90,8 @@ Gong API defaults: 3 requests/second, 10,000 requests/day. The server handles pa
 
 ## Troubleshooting
 
-- **Tool timeout errors**: Usually means the date range is too large. Try a shorter range or the server will chunk it automatically into 2-week windows.
-- **Authentication errors**: Verify your Access Key and Secret in the Claude Desktop config.
-- **No calls found**: Try a broader account filter. Use just the company name or email domain rather than a full string.
-- **"float has no attribute lower"**: This was a known bug that's been fixed. Make sure you're running the latest version of `gong_mcp.py`.
+- **Tool timeout errors** — date range is too large; try a shorter range
+- **Authentication errors** — verify your Access Key and Secret in your config
+- **No calls found** — try a broader account filter (company name, email domain, or partial match)
+- **Module not found** — re-run `pip install -r requirements.txt` inside the venv
+- **Tools not appearing** — restart Claude Code/Desktop; for Desktop use `Cmd+Q`
