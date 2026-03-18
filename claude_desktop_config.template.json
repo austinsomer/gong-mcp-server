@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "gong": {
+      "command": "/Users/YOUR_USERNAME/Documents/MCP/venv/bin/python3",
+      "args": [
+        "/Users/YOUR_USERNAME/Documents/MCP/gong_mcp.py"
+      ],
+      "env": {
+        "GONG_BASE_URL": "https://us-XXXX.api.gong.io",
+        "GONG_ACCESS_KEY": "YOUR_ACCESS_KEY",
+        "GONG_ACCESS_KEY_SECRET": "YOUR_ACCESS_KEY_SECRET"
+      }
+    }
+  }
+}

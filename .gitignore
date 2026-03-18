@@ -1,0 +1,11 @@
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Credentials (never commit these)
+gong.env
+claude_desktop_config.json
+
+# OS files
+.DS_Store
