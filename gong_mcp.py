@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-MCP Server for Gong API v2.
+MCP Server for Gong API v2 — Optimized (V2).
 
 Provides tools to interact with Gong's conversation intelligence platform,
 including listing calls, retrieving call metadata, and pulling transcripts.
-Supports filtering by account via participant email domain matching.
+Supports filtering by account via CRM context, call title, and participant matching.
+
+Optimizations over V1:
+  1. Persistent HTTP client (connection pooling) — eliminates per-request TCP handshake
+  2. Concurrent date-chunk fetching — asyncio.gather with Semaphore(3) rate limiting
+  3. Leaner payloads — context: "Basic" where possible, no contextTiming
+  4. 10-day chunks — optimal balance of parallelism vs API call overhead
+  5. Title-first matching — most common match checked first
+  6. Flat tool signatures — individual args instead of wrapped Pydantic model
 
 Authentication: Basic Auth (Access Key + Access Key Secret)
 Base URL: https://api.gong.io/v2
 Rate Limits: 3 calls/sec, 10,000 calls/day (default)
 """
 
+import asyncio
 import os
 import json
 import base64
 import re
 from typing import Optional, List, Dict, Any
-from enum import Enum
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from pydantic import BaseModel, Field, field_validator, ConfigDict
 from mcp.server.fastmcp import FastMCP
 
 # ─── Initialize MCP Server ───────────────────────────────────────────────────
@@ -34,14 +41,8 @@ API_BASE_URL = os.environ.get("GONG_BASE_URL", "https://api.gong.io") + "/v2"
 CHARACTER_LIMIT = 25000
 DEFAULT_PAGE_SIZE = 100
 REQUEST_TIMEOUT = 120.0
-
-
-# ─── Enums ────────────────────────────────────────────────────────────────────
-
-class ResponseFormat(str, Enum):
-    """Output format for tool responses."""
-    MARKDOWN = "markdown"
-    JSON = "json"
+CHUNK_DAYS = 10          # Optimized: 10-day chunks for concurrent fetching
+RATE_LIMIT_CONCURRENT = 3  # Gong rate limit: 3 requests/second
 
 
 # ─── Auth Helpers ─────────────────────────────────────────────────────────────
@@ -53,9 +54,6 @@ def _get_auth_header() -> Dict[str, str]:
     Gong uses HTTP Basic Auth where:
       - Username = GONG_ACCESS_KEY
       - Password = GONG_ACCESS_KEY_SECRET
-
-    The credentials are base64-encoded as 'key:secret' and sent
-    in the Authorization header.
     """
     access_key = os.environ.get("GONG_ACCESS_KEY", "")
     access_secret = os.environ.get("GONG_ACCESS_KEY_SECRET", "")
@@ -83,49 +81,58 @@ async def _make_api_request(
     method: str = "GET",
     body: Optional[Dict[str, Any]] = None,
     params: Optional[Dict[str, Any]] = None,
+    client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
     """
     Reusable function for all Gong API calls.
 
-    Handles auth header injection, timeout, and basic error raising.
-    All Gong v2 endpoints are relative to https://api.gong.io/v2.
+    Accepts an optional pre-existing httpx.AsyncClient for connection reuse.
+    Falls back to creating a new client if none provided.
     """
     headers = _get_auth_header()
     url = f"{API_BASE_URL}/{endpoint.lstrip('/')}"
 
-    async with httpx.AsyncClient() as client:
+    if client:
         response = await client.request(
-            method,
-            url,
-            headers=headers,
-            json=body,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
+            method, url, headers=headers, json=body, params=params, timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         return response.json()
+    else:
+        async with httpx.AsyncClient() as new_client:
+            response = await new_client.request(
+                method, url, headers=headers, json=body, params=params, timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.json()
+
+
+async def _make_api_request_with_semaphore(
+    endpoint: str,
+    method: str = "GET",
+    body: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    client: Optional[httpx.AsyncClient] = None,
+    semaphore: Optional[asyncio.Semaphore] = None,
+) -> Dict[str, Any]:
+    """API request with optional rate-limit semaphore."""
+    if semaphore:
+        async with semaphore:
+            return await _make_api_request(endpoint, method, body, params, client)
+    return await _make_api_request(endpoint, method, body, params, client)
 
 
 async def _paginated_post(
     endpoint: str,
     body: Dict[str, Any],
     results_key: str,
+    client: Optional[httpx.AsyncClient] = None,
+    semaphore: Optional[asyncio.Semaphore] = None,
 ) -> List[Dict[str, Any]]:
     """
     Handle Gong's cursor-based pagination for POST endpoints.
 
-    Gong POST endpoints (like /calls/transcript and /calls/extensive)
-    return a 'records' object with 'cursor' for pagination. This helper
-    follows the cursor until all pages are collected.
-
-    Args:
-        endpoint: The API path (e.g., 'calls/transcript')
-        body: The JSON request body including filter params
-        results_key: The top-level key in the response that holds the data
-                     (e.g., 'callTranscripts' or 'calls')
-
-    Returns:
-        Aggregated list of all records across all pages.
+    Uses persistent client and optional semaphore for rate limiting.
     """
     all_results: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
@@ -135,15 +142,15 @@ async def _paginated_post(
         if cursor:
             request_body["cursor"] = cursor
 
-        data = await _make_api_request(endpoint, method="POST", body=request_body)
+        data = await _make_api_request_with_semaphore(
+            endpoint, method="POST", body=request_body, client=client, semaphore=semaphore,
+        )
         page_results = data.get(results_key, [])
         all_results.extend(page_results)
 
         records = data.get("records", {})
         cursor = records.get("cursor")
-        total = records.get("totalRecords", len(all_results))
 
-        # If no cursor returned, we've hit the last page
         if not cursor:
             break
 
@@ -195,201 +202,23 @@ def _format_datetime(iso_str: Optional[str]) -> str:
         return iso_str
 
 
-# ─── Pydantic Input Models ───────────────────────────────────────────────────
-
-class ListCallsInput(BaseModel):
-    """Input for listing calls by date range."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    from_date_time: str = Field(
-        ...,
-        description="Start of date range in ISO-8601 format (e.g., '2025-01-01T00:00:00Z'). Required.",
-    )
-    to_date_time: str = Field(
-        ...,
-        description="End of date range in ISO-8601 format (exclusive). Required.",
-    )
-    workspace_id: Optional[str] = Field(
-        default=None,
-        description="Optional workspace ID to filter calls by a specific Gong workspace.",
-    )
-    cursor: Optional[str] = Field(
-        default=None,
-        description="Pagination cursor from a previous response. Omit for the first page.",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' (human-readable) or 'json' (machine-readable).",
-    )
-
-
-class GetCallInput(BaseModel):
-    """Input for retrieving a specific call's details."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    call_id: str = Field(
-        ...,
-        description="Gong's unique numeric call ID (up to 20 digits).",
-        min_length=1,
-        max_length=20,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
-
-
-class GetTranscriptsInput(BaseModel):
-    """Input for pulling call transcripts."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    from_date_time: str = Field(
-        ...,
-        description="Start of date range in ISO-8601 format. Required.",
-    )
-    to_date_time: str = Field(
-        ...,
-        description="End of date range in ISO-8601 format (exclusive). Required.",
-    )
-    call_ids: Optional[List[str]] = Field(
-        default=None,
-        description="Optional list of specific call IDs to retrieve transcripts for. If provided, only these calls (within the date range) are returned.",
-    )
-    workspace_id: Optional[str] = Field(
-        default=None,
-        description="Optional workspace ID filter.",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
-
-
-class GetCallsExtensiveInput(BaseModel):
-    """Input for retrieving detailed call data with metadata."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    from_date_time: str = Field(
-        ...,
-        description="Start of date range in ISO-8601 format. Required.",
-    )
-    to_date_time: str = Field(
-        ...,
-        description="End of date range in ISO-8601 format (exclusive). Required.",
-    )
-    call_ids: Optional[List[str]] = Field(
-        default=None,
-        description="Optional list of specific call IDs to retrieve.",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' or 'json'.",
-    )
-
-
-class GetAccountTranscriptsInput(BaseModel):
-    """
-    Input for the workflow tool that finds calls associated with
-    an account and pulls their transcripts in one operation.
-    """
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    from_date_time: str = Field(
-        ...,
-        description="Start of date range in ISO-8601 format. Required.",
-    )
-    to_date_time: str = Field(
-        ...,
-        description="End of date range in ISO-8601 format (exclusive). Required.",
-    )
-    account_filter: str = Field(
-        ...,
-        description=(
-            "Filter string to match against participant email domains or names. "
-            "Examples: 'acme.com' to match all @acme.com participants, or 'Acme Corp' "
-            "to match against participant/company names. Case-insensitive."
-        ),
-        min_length=1,
-        max_length=200,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.JSON,
-        description="Output format: 'markdown' or 'json'. Defaults to JSON for this workflow tool.",
-    )
-
-    @field_validator("account_filter")
-    @classmethod
-    def validate_account_filter(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("account_filter cannot be empty.")
-        return v.strip()
-
-
-class ExportAccountTranscriptsInput(BaseModel):
-    """
-    Input for exporting full account transcripts to files.
-
-    Unlike gong_get_account_transcripts which returns text (subject to
-    character limits), this tool writes complete transcripts directly
-    to disk as markdown files with no truncation.
-    """
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    from_date_time: str = Field(
-        ...,
-        description="Start of date range in ISO-8601 format (e.g., '2025-01-01T00:00:00Z'). Required.",
-    )
-    to_date_time: str = Field(
-        ...,
-        description="End of date range in ISO-8601 format (exclusive). Required.",
-    )
-    account_filter: str = Field(
-        ...,
-        description=(
-            "Filter string to match against CRM account names, call titles, "
-            "and participant email domains. Examples: 'acme.com', 'Acme Corp', "
-            "'tracelink'. Case-insensitive."
-        ),
-        min_length=1,
-        max_length=200,
-    )
-    output_dir: str = Field(
-        default="~/Documents/Transcripts",
-        description=(
-            "Base directory where transcript files will be saved. Defaults to ~/Documents/Transcripts. "
-            "A subfolder named after the account/company is created automatically."
-        ),
-    )
-
-    @field_validator("account_filter")
-    @classmethod
-    def validate_account_filter(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("account_filter cannot be empty.")
-        return v.strip()
-
-
 # ─── File Export Helpers ─────────────────────────────────────────────────────
 
 def _sanitize_filename(name: str) -> str:
     """Convert a string into a safe filename."""
-    # Replace common separators with underscores
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
-    # Collapse multiple underscores/spaces
     name = re.sub(r'[\s_]+', '_', name)
-    # Strip leading/trailing underscores and dots
     name = name.strip('_.')
-    # Truncate to reasonable length
     return name[:100] if name else "untitled"
 
 
-def _chunk_date_range(from_dt: str, to_dt: str, chunk_days: int = 14) -> List[tuple]:
+def _chunk_date_range(from_dt: str, to_dt: str, chunk_days: int = CHUNK_DAYS) -> List[tuple]:
     """
-    Split a date range into smaller chunks to keep API calls fast.
+    Split a date range into smaller chunks for concurrent fetching.
 
     Returns a list of (from_iso, to_iso) string tuples. Each chunk spans
-    up to chunk_days days. This prevents timeouts when scanning large
-    date ranges via Gong's extensive calls endpoint.
+    up to chunk_days days. Using 10-day chunks enables 3 concurrent
+    requests for a 30-day range, matching the Gong rate limit.
     """
     start = datetime.fromisoformat(from_dt.replace("Z", "+00:00"))
     end = datetime.fromisoformat(to_dt.replace("Z", "+00:00"))
@@ -409,12 +238,7 @@ def _format_transcript_markdown(
     resolved_transcript: List[Dict[str, Any]],
     parties: List[Dict[str, Any]],
 ) -> str:
-    """
-    Format a single call's transcript as a complete markdown document.
-
-    Includes metadata header, participant list, and full speaker-labeled
-    transcript with no character limit.
-    """
+    """Format a single call's transcript as a complete markdown document."""
     title = call_meta.get("title", "Untitled Call")
     call_id = call_meta.get("call_id", "N/A")
     scheduled = call_meta.get("scheduled", "N/A")
@@ -457,13 +281,108 @@ def _format_transcript_markdown(
 
         if speaker != current_speaker:
             if current_speaker is not None:
-                lines.append("")  # Blank line between speaker changes
+                lines.append("")
             lines.append(f"**{speaker}**:")
             current_speaker = speaker
 
         lines.append(f"{text}")
 
     return "\n".join(lines)
+
+
+# ─── Account Matching ────────────────────────────────────────────────────────
+
+def _matches_account(call: Dict[str, Any], account_filter_lower: str) -> Optional[str]:
+    """
+    Check if a call matches the account filter. Returns match reason or None.
+
+    Optimized: checks title first (most common match, cheapest to evaluate),
+    then CRM context, then participant email/company.
+    """
+    # Tier 1 — call title (cheapest check)
+    call_title = (call.get("metaData", {}).get("title") or "").lower()
+    if account_filter_lower in call_title:
+        return "call_title"
+
+    # Tier 2 — CRM Account context
+    for ctx in call.get("context", []):
+        for obj in ctx.get("objects", []):
+            if obj.get("objectType") == "Account":
+                for f in obj.get("fields", []):
+                    fname = str(f.get("name") or "").lower()
+                    fvalue = str(f.get("value") or "").lower()
+                    if fname in ("name", "website") and account_filter_lower in fvalue:
+                        return f"crm_account_{fname}"
+
+    # Tier 3 — participant email / company
+    for party in call.get("parties", []):
+        email = str(party.get("emailAddress") or "").lower()
+        company = str(party.get("company") or "").lower()
+        if account_filter_lower in email:
+            return "participant_email"
+        if account_filter_lower in company:
+            return "participant_company"
+
+    return None
+
+
+# ─── Concurrent Discovery ────────────────────────────────────────────────────
+
+async def _discover_chunk(
+    client: httpx.AsyncClient,
+    chunk_from: str,
+    chunk_to: str,
+    content_selector: Dict[str, Any],
+    semaphore: asyncio.Semaphore,
+) -> List[Dict[str, Any]]:
+    """Fetch all calls in one date chunk via paginated extensive endpoint."""
+    all_calls: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+
+    while True:
+        request_body: Dict[str, Any] = {
+            "filter": {
+                "fromDateTime": chunk_from,
+                "toDateTime": chunk_to,
+            },
+            "contentSelector": content_selector,
+        }
+        if cursor:
+            request_body["cursor"] = cursor
+
+        data = await _make_api_request_with_semaphore(
+            "calls/extensive", method="POST", body=request_body,
+            client=client, semaphore=semaphore,
+        )
+        all_calls.extend(data.get("calls", []))
+        cursor = data.get("records", {}).get("cursor")
+        if not cursor:
+            break
+
+    return all_calls
+
+
+async def _discover_calls_concurrent(
+    client: httpx.AsyncClient,
+    from_dt: str,
+    to_dt: str,
+    content_selector: Dict[str, Any],
+    semaphore: asyncio.Semaphore,
+) -> List[Dict[str, Any]]:
+    """
+    Discover calls across date range using concurrent chunk fetching.
+
+    Splits the range into CHUNK_DAYS-sized chunks and fetches them
+    in parallel, respecting the rate limit via semaphore.
+    """
+    date_chunks = _chunk_date_range(from_dt, to_dt)
+
+    tasks = [
+        _discover_chunk(client, chunk_from, chunk_to, content_selector, semaphore)
+        for chunk_from, chunk_to in date_chunks
+    ]
+    chunk_results = await asyncio.gather(*tasks)
+    return [call for chunk in chunk_results for call in chunk]
 
 
 # ─── Tool Definitions ────────────────────────────────────────────────────────
@@ -478,7 +397,13 @@ def _format_transcript_markdown(
         "openWorldHint": True,
     },
 )
-async def gong_list_calls(params: ListCallsInput) -> str:
+async def gong_list_calls(
+    from_date_time: str,
+    to_date_time: str,
+    workspace_id: Optional[str] = None,
+    cursor: Optional[str] = None,
+    response_format: str = "markdown",
+) -> str:
     """
     List calls from Gong within a date range.
 
@@ -486,44 +411,25 @@ async def gong_list_calls(params: ListCallsInput) -> str:
     for calls that occurred between from_date_time and to_date_time.
     Supports pagination via cursor.
 
+    Args:
+        from_date_time: Start of date range in ISO-8601 format (e.g., '2025-01-01T00:00:00Z'). Required.
+        to_date_time: End of date range in ISO-8601 format (exclusive). Required.
+        workspace_id: Optional workspace ID to filter calls by a specific Gong workspace.
+        cursor: Pagination cursor from a previous response. Omit for the first page.
+        response_format: Output format — 'markdown' (human-readable) or 'json' (machine-readable).
+
     Endpoint: GET /v2/calls
     Required scope: api:calls:read:basic
-
-    Args:
-        params (ListCallsInput):
-            - from_date_time (str): ISO-8601 start date
-            - to_date_time (str): ISO-8601 end date (exclusive)
-            - workspace_id (Optional[str]): Filter by workspace
-            - cursor (Optional[str]): Pagination cursor
-            - response_format (ResponseFormat): 'markdown' or 'json'
-
-    Returns:
-        str: Call list with pagination info. JSON schema:
-        {
-            "total_records": int,
-            "cursor": str | null,
-            "calls": [
-                {
-                    "id": str,
-                    "title": str,
-                    "scheduled": str,
-                    "started": str,
-                    "duration": int,
-                    "url": str,
-                    "direction": str
-                }
-            ]
-        }
     """
     try:
         query_params: Dict[str, Any] = {
-            "fromDateTime": params.from_date_time,
-            "toDateTime": params.to_date_time,
+            "fromDateTime": from_date_time,
+            "toDateTime": to_date_time,
         }
-        if params.workspace_id:
-            query_params["workspaceId"] = params.workspace_id
-        if params.cursor:
-            query_params["cursor"] = params.cursor
+        if workspace_id:
+            query_params["workspaceId"] = workspace_id
+        if cursor:
+            query_params["cursor"] = cursor
 
         data = await _make_api_request("calls", method="GET", params=query_params)
 
@@ -535,9 +441,9 @@ async def gong_list_calls(params: ListCallsInput) -> str:
         if not calls:
             return "No calls found in the specified date range."
 
-        if params.response_format == ResponseFormat.MARKDOWN:
+        if response_format.lower() == "markdown":
             lines = [
-                f"# Gong Calls ({params.from_date_time} to {params.to_date_time})",
+                f"# Gong Calls ({from_date_time} to {to_date_time})",
                 f"Showing {len(calls)} of {total} calls",
                 "",
             ]
@@ -582,43 +488,29 @@ async def gong_list_calls(params: ListCallsInput) -> str:
         "openWorldHint": True,
     },
 )
-async def gong_get_call(params: GetCallInput) -> str:
+async def gong_get_call(
+    call_id: str,
+    response_format: str = "markdown",
+) -> str:
     """
     Retrieve detailed metadata for a specific Gong call by ID.
 
     Returns call details including title, participants, scheduled time,
     duration, media info, and CRM associations.
 
+    Args:
+        call_id: Gong's unique numeric call ID (up to 20 digits). Required.
+        response_format: Output format — 'markdown' or 'json'.
+
     Endpoint: GET /v2/calls/{id}
     Required scope: api:calls:read:basic
-
-    Args:
-        params (GetCallInput):
-            - call_id (str): Gong's numeric call identifier
-            - response_format (ResponseFormat): 'markdown' or 'json'
-
-    Returns:
-        str: Call details. JSON schema:
-        {
-            "id": str,
-            "title": str,
-            "scheduled": str,
-            "started": str,
-            "duration": int,
-            "url": str,
-            "parties": [...],
-            "media": str,
-            "language": str,
-            "direction": str,
-            "scope": str
-        }
     """
     try:
-        data = await _make_api_request(f"calls/{params.call_id}", method="GET")
+        data = await _make_api_request(f"calls/{call_id}", method="GET")
 
         call = data.get("call", data)
 
-        if params.response_format == ResponseFormat.MARKDOWN:
+        if response_format.lower() == "markdown":
             title = call.get("title", "Untitled")
             lines = [
                 f"# {title}",
@@ -661,77 +553,58 @@ async def gong_get_call(params: GetCallInput) -> str:
         "openWorldHint": True,
     },
 )
-async def gong_get_transcripts(params: GetTranscriptsInput) -> str:
+async def gong_get_transcripts(
+    from_date_time: str,
+    to_date_time: str,
+    call_ids: Optional[List[str]] = None,
+    workspace_id: Optional[str] = None,
+    response_format: str = "markdown",
+) -> str:
     """
     Retrieve call transcripts from Gong within a date range.
 
     Returns full transcript text for calls, with optional filtering by
-    specific call IDs. Handles pagination automatically to collect all
-    matching transcripts.
+    specific call IDs. Handles pagination automatically.
+
+    Args:
+        from_date_time: Start of date range in ISO-8601 format. Required.
+        to_date_time: End of date range in ISO-8601 format (exclusive). Required.
+        call_ids: Optional list of specific call IDs to retrieve transcripts for.
+        workspace_id: Optional workspace ID filter.
+        response_format: Output format — 'markdown' or 'json'.
 
     Endpoint: POST /v2/calls/transcript
     Required scope: api:calls:read:transcript
-
-    Args:
-        params (GetTranscriptsInput):
-            - from_date_time (str): ISO-8601 start date
-            - to_date_time (str): ISO-8601 end date (exclusive)
-            - call_ids (Optional[List[str]]): Specific call IDs to retrieve
-            - workspace_id (Optional[str]): Workspace filter
-            - response_format (ResponseFormat): 'markdown' or 'json'
-
-    Returns:
-        str: Transcripts data. JSON schema:
-        {
-            "total_transcripts": int,
-            "transcripts": [
-                {
-                    "callId": str,
-                    "transcript": [
-                        {
-                            "speakerId": str,
-                            "topic": str,
-                            "sentences": [
-                                {
-                                    "start": float,
-                                    "end": float,
-                                    "text": str
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        }
     """
     try:
         filter_body: Dict[str, Any] = {
             "filter": {
-                "fromDateTime": params.from_date_time,
-                "toDateTime": params.to_date_time,
+                "fromDateTime": from_date_time,
+                "toDateTime": to_date_time,
             }
         }
-        if params.call_ids:
-            filter_body["filter"]["callIds"] = params.call_ids
-        if params.workspace_id:
-            filter_body["filter"]["workspaceId"] = params.workspace_id
+        if call_ids:
+            filter_body["filter"]["callIds"] = call_ids
+        if workspace_id:
+            filter_body["filter"]["workspaceId"] = workspace_id
 
-        transcripts = await _paginated_post(
-            "calls/transcript", filter_body, "callTranscripts"
-        )
+        async with httpx.AsyncClient() as client:
+            transcripts = await _paginated_post(
+                "calls/transcript", filter_body, "callTranscripts", client=client,
+            )
 
         if not transcripts:
             return "No transcripts found for the specified filters."
 
-        if params.response_format == ResponseFormat.MARKDOWN:
+        if response_format.lower() == "markdown":
             lines = [
                 f"# Gong Call Transcripts",
                 f"Retrieved {len(transcripts)} transcript(s)",
                 "",
             ]
             for t in transcripts:
-                call_id = t.get("callId", "Unknown")
-                lines.append(f"## Call ID: {call_id}")
+                cid = t.get("callId", "Unknown")
+                lines.append(f"## Call ID: {cid}")
                 lines.append("")
 
                 transcript_entries = t.get("transcript", [])
@@ -772,65 +645,62 @@ async def gong_get_transcripts(params: GetTranscriptsInput) -> str:
         "openWorldHint": True,
     },
 )
-async def gong_list_calls_extensive(params: GetCallsExtensiveInput) -> str:
+async def gong_list_calls_extensive(
+    from_date_time: str,
+    to_date_time: str,
+    call_ids: Optional[List[str]] = None,
+    response_format: str = "markdown",
+) -> str:
     """
     Retrieve detailed call data from Gong, including participants,
     interaction stats, content info, and CRM context.
 
-    This endpoint returns richer data than gong_list_calls, including
-    participant details (names, emails, affiliations) which enables
-    filtering by account/company. Handles pagination automatically.
+    Optimized: Uses concurrent chunk fetching for large date ranges.
+
+    Args:
+        from_date_time: Start of date range in ISO-8601 format. Required.
+        to_date_time: End of date range in ISO-8601 format (exclusive). Required.
+        call_ids: Optional list of specific call IDs to retrieve.
+        response_format: Output format — 'markdown' or 'json'.
 
     Endpoint: POST /v2/calls/extensive
     Required scope: api:calls:read:extensive
-
-    Args:
-        params (GetCallsExtensiveInput):
-            - from_date_time (str): ISO-8601 start date
-            - to_date_time (str): ISO-8601 end date (exclusive)
-            - call_ids (Optional[List[str]]): Specific call IDs
-            - response_format (ResponseFormat): 'markdown' or 'json'
-
-    Returns:
-        str: Detailed call data. JSON schema:
-        {
-            "total_calls": int,
-            "calls": [
-                {
-                    "metaData": { "id": str, "title": str, ... },
-                    "parties": [
-                        { "name": str, "emailAddress": str, "affiliation": str }
-                    ],
-                    "content": { ... },
-                    "interaction": { ... },
-                    "context": [ ... ]
-                }
-            ]
-        }
     """
     try:
-        filter_body: Dict[str, Any] = {
-            "filter": {
-                "fromDateTime": params.from_date_time,
-                "toDateTime": params.to_date_time,
-            },
-            "contentSelector": {
-                "context": "Extended",
-                "contextTiming": ["Now", "TimeOfCall"],
-                "exposedFields": {
-                    "parties": True,
-                },
+        content_selector = {
+            "context": "Extended",
+            "exposedFields": {
+                "parties": True,
             },
         }
-        if params.call_ids:
-            filter_body["filter"]["callIds"] = params.call_ids
 
-        calls = await _paginated_post("calls/extensive", filter_body, "calls")
+        if call_ids:
+            # Specific call IDs: no chunking needed
+            filter_body: Dict[str, Any] = {
+                "filter": {
+                    "fromDateTime": from_date_time,
+                    "toDateTime": to_date_time,
+                    "callIds": call_ids,
+                },
+                "contentSelector": content_selector,
+            }
+            async with httpx.AsyncClient() as client:
+                calls = await _paginated_post(
+                    "calls/extensive", filter_body, "calls", client=client,
+                )
+        else:
+            # Full date range: use concurrent fetching
+            semaphore = asyncio.Semaphore(RATE_LIMIT_CONCURRENT)
+            async with httpx.AsyncClient() as client:
+                calls = await _discover_calls_concurrent(
+                    client, from_date_time, to_date_time,
+                    content_selector, semaphore,
+                )
 
         if not calls:
             return "No calls found for the specified filters."
 
-        if params.response_format == ResponseFormat.MARKDOWN:
+        if response_format.lower() == "markdown":
             lines = [
                 f"# Gong Calls (Extensive)",
                 f"Retrieved {len(calls)} call(s)",
@@ -857,7 +727,6 @@ async def gong_list_calls_extensive(params: GetCallsExtensiveInput) -> str:
                         affiliation = p.get("affiliation", "")
                         lines.append(f"  - {name} ({email}) [{affiliation}]")
 
-                # Show CRM context if available
                 context_list = call.get("context", [])
                 for ctx in context_list:
                     for obj in ctx.get("objects", []):
@@ -892,169 +761,118 @@ async def gong_list_calls_extensive(params: GetCallsExtensiveInput) -> str:
         "openWorldHint": True,
     },
 )
-async def gong_get_account_transcripts(params: GetAccountTranscriptsInput) -> str:
+async def gong_get_account_transcripts(
+    from_date_time: str,
+    to_date_time: str,
+    account_filter: str,
+    response_format: str = "json",
+) -> str:
     """
-    Workflow tool: Find all calls associated with a specific account
-    and retrieve their transcripts in one operation.
+    Workflow tool: Find all calls for a specific account and retrieve transcripts.
 
-    Since Gong's API does not support filtering calls by account name
-    directly, this tool performs a two-step workflow:
+    Optimized V2: Uses concurrent chunk fetching + Basic context (significantly faster).
 
-    1. Pulls all calls (extensive) in the date range with participant data
-    2. Filters calls where any participant's email domain or name matches
-       the account_filter string (case-insensitive)
-    3. Retrieves transcripts for all matching call IDs
-
-    This is the recommended tool when you need transcripts for a specific
-    company/account.
+    Steps:
+      1. Concurrently fetches calls across 10-day date chunks
+      2. Filters by title, CRM context, and participant matching (case-insensitive)
+      3. Retrieves transcripts for all matched call IDs
 
     Args:
-        params (GetAccountTranscriptsInput):
-            - from_date_time (str): ISO-8601 start date
-            - to_date_time (str): ISO-8601 end date (exclusive)
-            - account_filter (str): Email domain (e.g., 'acme.com') or
-              company name to match against participants. Case-insensitive.
-            - response_format (ResponseFormat): 'markdown' or 'json'
-
-    Returns:
-        str: Matched calls and their transcripts. JSON schema:
-        {
-            "account_filter": str,
-            "date_range": { "from": str, "to": str },
-            "matched_calls": int,
-            "total_calls_scanned": int,
-            "calls": [
-                {
-                    "call_id": str,
-                    "title": str,
-                    "scheduled": str,
-                    "duration": int,
-                    "matched_participants": [str],
-                    "transcript": [...]
-                }
-            ]
-        }
+        from_date_time: Start of date range in ISO-8601 format. Required.
+        to_date_time: End of date range in ISO-8601 format (exclusive). Required.
+        account_filter: Filter string to match against call titles, CRM account names,
+            and participant email domains. Examples: 'acme.com', 'Acme Corp'. Case-insensitive.
+        response_format: Output format — 'markdown' or 'json'.
     """
+    if not account_filter or not account_filter.strip():
+        return "Error: account_filter cannot be empty."
+
     try:
-        # Step 1: Discovery via POST /v2/calls/extensive
-        # Uses context: "Extended" to get CRM Account objects for matching
-        filter_body: Dict[str, Any] = {
-            "filter": {
-                "fromDateTime": params.from_date_time,
-                "toDateTime": params.to_date_time,
-            },
-            "contentSelector": {
-                "context": "Extended",
-                "contextTiming": ["Now", "TimeOfCall"],
-                "exposedFields": {
-                    "parties": True,
-                },
-            },
+        semaphore = asyncio.Semaphore(RATE_LIMIT_CONCURRENT)
+        content_selector = {
+            "context": "Basic",
+            "exposedFields": {"parties": True},
         }
 
-        all_calls = await _paginated_post("calls/extensive", filter_body, "calls")
-
-        if not all_calls:
-            return f"No calls found in the date range {params.from_date_time} to {params.to_date_time}."
-
-        # Step 2: Filter by account using CRM context + participant fallback
-        account_filter_lower = params.account_filter.lower()
-        matched_calls: List[Dict[str, Any]] = []
-
-        for call in all_calls:
-            matched_by: Optional[str] = None
-            matched_participants: List[str] = []
-
-            # Build speaker map: speakerId -> {name, email}
-            speaker_map: Dict[str, Dict[str, str]] = {}
-            parties = call.get("parties", [])
-            for party in parties:
-                sid = str(party.get("speakerId", ""))
-                if sid:
-                    speaker_map[sid] = {
-                        "name": party.get("name", "Unknown"),
-                        "email": party.get("emailAddress", ""),
-                        "affiliation": party.get("affiliation", ""),
-                    }
-
-            # Primary match: CRM Account objects in context[]
-            context_list = call.get("context", [])
-            for ctx in context_list:
-                for obj in ctx.get("objects", []):
-                    obj_type = obj.get("objectType", "")
-                    if obj_type == "Account":
-                        fields = obj.get("fields", [])
-                        for f in fields:
-                            fname = str(f.get("name") or "").lower()
-                            fvalue = str(f.get("value") or "").lower()
-                            if fname in ("name", "website") and account_filter_lower in fvalue:
-                                matched_by = f"crm_account_{fname}"
-
-            # Secondary match: call title contains account name
-            if not matched_by:
-                call_title = (call.get("metaData", {}).get("title") or "").lower()
-                if account_filter_lower in call_title:
-                    matched_by = "call_title"
-
-            # Fallback match: participant email domain or company name
-            if not matched_by:
-                for party in parties:
-                    email = str(party.get("emailAddress") or "").lower()
-                    name = str(party.get("name") or "").lower()
-                    company = str(party.get("company") or "").lower()
-
-                    if (
-                        account_filter_lower in email
-                        or account_filter_lower in company
-                    ):
-                        matched_by = "participant_email_domain" if account_filter_lower in email else "participant_company"
-                        display = party.get("name", party.get("emailAddress", "Unknown"))
-                        email_display = party.get("emailAddress", "")
-                        matched_participants.append(
-                            f"{display} ({email_display})" if email_display else display
-                        )
-
-            if matched_by:
-                meta = call.get("metaData", {})
-                matched_calls.append({
-                    "call_id": str(meta.get("id", "")),
-                    "title": meta.get("title", "Untitled"),
-                    "scheduled": meta.get("scheduled"),
-                    "duration": meta.get("duration", 0),
-                    "matched_by": matched_by,
-                    "matched_participants": matched_participants,
-                    "speaker_map": speaker_map,
-                    "parties": parties,
-                })
-
-        if not matched_calls:
-            return (
-                f"No calls found matching '{params.account_filter}' in the date range. "
-                f"Scanned {len(all_calls)} total calls. "
-                f"Try a broader filter (e.g., just the email domain like 'acme.com')."
+        async with httpx.AsyncClient() as client:
+            # Step 1: Concurrent discovery
+            all_calls = await _discover_calls_concurrent(
+                client, from_date_time, to_date_time,
+                content_selector, semaphore,
             )
 
-        # Step 3: Retrieve transcripts for matched call IDs
-        matched_call_ids = [c["call_id"] for c in matched_calls]
+            if not all_calls:
+                return f"No calls found in the date range {from_date_time} to {to_date_time}."
 
-        transcript_body: Dict[str, Any] = {
-            "filter": {
-                "fromDateTime": params.from_date_time,
-                "toDateTime": params.to_date_time,
-                "callIds": matched_call_ids,
+            # Step 2: Filter by account
+            account_filter_lower = account_filter.strip().lower()
+            matched_calls: List[Dict[str, Any]] = []
+
+            for call in all_calls:
+                matched_by = _matches_account(call, account_filter_lower)
+
+                if matched_by:
+                    speaker_map: Dict[str, Dict[str, str]] = {}
+                    parties = call.get("parties", [])
+                    for party in parties:
+                        sid = str(party.get("speakerId", ""))
+                        if sid:
+                            speaker_map[sid] = {
+                                "name": party.get("name", "Unknown"),
+                                "email": party.get("emailAddress", ""),
+                                "affiliation": party.get("affiliation", ""),
+                            }
+
+                    matched_participants = []
+                    if "participant" in matched_by:
+                        for party in parties:
+                            email = str(party.get("emailAddress") or "").lower()
+                            company = str(party.get("company") or "").lower()
+                            if account_filter_lower in email or account_filter_lower in company:
+                                display = party.get("name", party.get("emailAddress", "Unknown"))
+                                email_display = party.get("emailAddress", "")
+                                matched_participants.append(
+                                    f"{display} ({email_display})" if email_display else display
+                                )
+
+                    meta = call.get("metaData", {})
+                    matched_calls.append({
+                        "call_id": str(meta.get("id", "")),
+                        "title": meta.get("title", "Untitled"),
+                        "scheduled": meta.get("scheduled"),
+                        "duration": meta.get("duration", 0),
+                        "matched_by": matched_by,
+                        "matched_participants": matched_participants,
+                        "speaker_map": speaker_map,
+                        "parties": parties,
+                    })
+
+            if not matched_calls:
+                return (
+                    f"No calls found matching '{account_filter}' in the date range. "
+                    f"Scanned {len(all_calls)} total calls. "
+                    f"Try a broader filter (e.g., just the email domain like 'acme.com')."
+                )
+
+            # Step 3: Retrieve transcripts
+            matched_call_ids = [c["call_id"] for c in matched_calls]
+            transcript_body: Dict[str, Any] = {
+                "filter": {
+                    "fromDateTime": from_date_time,
+                    "toDateTime": to_date_time,
+                    "callIds": matched_call_ids,
+                }
             }
-        }
+            transcripts = await _paginated_post(
+                "calls/transcript", transcript_body, "callTranscripts",
+                client=client, semaphore=semaphore,
+            )
 
-        transcripts = await _paginated_post(
-            "calls/transcript", transcript_body, "callTranscripts"
-        )
-
-        # Build lookup: call_id -> raw transcript
+        # Build lookup and resolve speaker IDs to names
         transcript_map: Dict[str, Any] = {}
         for t in transcripts:
             transcript_map[str(t.get("callId", ""))] = t.get("transcript", [])
 
-        # Merge transcripts and resolve speaker IDs to names
         for call in matched_calls:
             raw_transcript = transcript_map.get(call["call_id"], [])
             smap = call.get("speaker_map", {})
@@ -1066,25 +884,23 @@ async def gong_get_account_transcripts(params: GetAccountTranscriptsInput) -> st
                 speaker_name = speaker_info.get("name", f"Speaker {sid}")
                 speaker_email = speaker_info.get("email", "")
 
-                resolved_sentences = []
                 for sentence in segment.get("sentences", []):
-                    resolved_sentences.append({
+                    resolved_transcript.append({
                         "speaker": speaker_name,
                         "email": speaker_email,
                         "text": sentence.get("text", ""),
                         "start": sentence.get("start"),
                         "end": sentence.get("end"),
                     })
-                resolved_transcript.extend(resolved_sentences)
 
             call["transcript"] = raw_transcript
             call["resolvedTranscript"] = resolved_transcript
 
-        if params.response_format == ResponseFormat.MARKDOWN:
+        if response_format.lower() == "markdown":
             lines = [
-                f"# Transcripts for '{params.account_filter}'",
+                f"# Transcripts for '{account_filter}'",
                 f"Found {len(matched_calls)} matching calls out of {len(all_calls)} scanned",
-                f"Date range: {params.from_date_time} to {params.to_date_time}",
+                f"Date range: {from_date_time} to {to_date_time}",
                 "",
             ]
             for call in matched_calls:
@@ -1114,7 +930,6 @@ async def gong_get_account_transcripts(params: GetAccountTranscriptsInput) -> st
 
             return _truncate_response("\n".join(lines))
         else:
-            # Clean up internal fields before JSON output
             output_calls = []
             for call in matched_calls:
                 output_calls.append({
@@ -1131,10 +946,10 @@ async def gong_get_account_transcripts(params: GetAccountTranscriptsInput) -> st
                     "resolvedTranscript": call.get("resolvedTranscript", []),
                 })
             result = {
-                "account_filter": params.account_filter,
+                "account_filter": account_filter,
                 "date_range": {
-                    "from": params.from_date_time,
-                    "to": params.to_date_time,
+                    "from": from_date_time,
+                    "to": to_date_time,
                 },
                 "matched_calls": len(matched_calls),
                 "total_calls_scanned": len(all_calls),
@@ -1156,159 +971,117 @@ async def gong_get_account_transcripts(params: GetAccountTranscriptsInput) -> st
         "openWorldHint": True,
     },
 )
-async def gong_export_account_transcripts(params: ExportAccountTranscriptsInput) -> str:
+async def gong_export_account_transcripts(
+    from_date_time: str,
+    to_date_time: str,
+    account_filter: str,
+    output_dir: str = "~/Documents/Transcripts",
+) -> str:
     """
     Export full call transcripts for a specific account to markdown files.
 
-    This tool solves the truncation problem by writing transcripts directly
-    to disk instead of returning them as text. It performs the same account
-    matching as gong_get_account_transcripts (CRM context, call titles,
-    participant emails) but outputs complete, untruncated transcript files.
+    Optimized V2: Concurrent discovery significantly faster than V1.
 
     Output structure:
-        {output_dir}/{account}_gong_transcripts/
-            YYYY-MM-DD_{call_title}.md          # Individual transcript per call
-            _combined_transcripts.md            # All transcripts in one file
-
-    Each file includes call metadata (date, duration, participants, Gong link)
-    followed by the full speaker-labeled transcript.
+        {output_dir}/{account}/
+            YYYY-MM-DD_{call_title}.md   — individual transcript per call
+            _combined_transcripts.md     — all transcripts in one file
 
     Args:
-        params (ExportAccountTranscriptsInput):
-            - from_date_time (str): ISO-8601 start date
-            - to_date_time (str): ISO-8601 end date (exclusive)
-            - account_filter (str): Account name, email domain, or keyword
-              to match against CRM data, call titles, and participants.
-            - output_dir (str): Base directory for output (default: ~/Documents)
-
-    Returns:
-        str: Summary of exported files including paths, call count, and
-        total transcript size. Does NOT return transcript content directly.
+        from_date_time: Start of date range in ISO-8601 format (e.g., '2025-01-01T00:00:00Z'). Required.
+        to_date_time: End of date range in ISO-8601 format (exclusive). Required.
+        account_filter: Account name, email domain, or keyword to match against CRM data,
+            call titles, and participants. Examples: 'acme.com', 'Acme Corp'. Case-insensitive.
+        output_dir: Base directory where transcript files will be saved. Defaults to ~/Documents/Transcripts.
     """
+    if not account_filter or not account_filter.strip():
+        return "Error: account_filter cannot be empty."
+
     try:
-        # ── Step 1: Discover calls via POST /v2/calls/extensive ──────────
-        # Chunk the date range into 2-week windows to avoid timeouts
-        # on large date ranges (each chunk is a separate paginated API call)
-        date_chunks = _chunk_date_range(
-            params.from_date_time, params.to_date_time, chunk_days=14
-        )
-
-        all_calls: List[Dict[str, Any]] = []
-        for chunk_from, chunk_to in date_chunks:
-            filter_body: Dict[str, Any] = {
-                "filter": {
-                    "fromDateTime": chunk_from,
-                    "toDateTime": chunk_to,
-                },
-                "contentSelector": {
-                    "context": "Extended",
-                    "contextTiming": ["Now", "TimeOfCall"],
-                    "exposedFields": {
-                        "parties": True,
-                    },
-                },
-            }
-            chunk_calls = await _paginated_post("calls/extensive", filter_body, "calls")
-            all_calls.extend(chunk_calls)
-
-        if not all_calls:
-            return f"No calls found in the date range {params.from_date_time} to {params.to_date_time}."
-
-        # ── Step 2: Filter by account ────────────────────────────────────
-        account_filter_lower = params.account_filter.lower()
-        matched_calls: List[Dict[str, Any]] = []
-
-        for call in all_calls:
-            matched_by: Optional[str] = None
-            matched_participants: List[str] = []
-
-            # Build speaker map: speakerId -> {name, email, affiliation}
-            speaker_map: Dict[str, Dict[str, str]] = {}
-            parties = call.get("parties", [])
-            for party in parties:
-                sid = str(party.get("speakerId", ""))
-                if sid:
-                    speaker_map[sid] = {
-                        "name": party.get("name", "Unknown"),
-                        "email": party.get("emailAddress", ""),
-                        "affiliation": party.get("affiliation", ""),
-                    }
-
-            # Primary match: CRM Account objects
-            context_list = call.get("context", [])
-            for ctx in context_list:
-                for obj in ctx.get("objects", []):
-                    obj_type = obj.get("objectType", "")
-                    if obj_type == "Account":
-                        fields = obj.get("fields", [])
-                        for f in fields:
-                            fname = str(f.get("name") or "").lower()
-                            fvalue = str(f.get("value") or "").lower()
-                            if fname in ("name", "website") and account_filter_lower in fvalue:
-                                matched_by = f"crm_account_{fname}"
-
-            # Secondary match: call title
-            if not matched_by:
-                call_title = (call.get("metaData", {}).get("title") or "").lower()
-                if account_filter_lower in call_title:
-                    matched_by = "call_title"
-
-            # Fallback match: participant email domain or company
-            if not matched_by:
-                for party in parties:
-                    email = str(party.get("emailAddress") or "").lower()
-                    company = str(party.get("company") or "").lower()
-
-                    if account_filter_lower in email or account_filter_lower in company:
-                        matched_by = "participant_email_domain" if account_filter_lower in email else "participant_company"
-                        display = party.get("name", party.get("emailAddress", "Unknown"))
-                        email_display = party.get("emailAddress", "")
-                        matched_participants.append(
-                            f"{display} ({email_display})" if email_display else display
-                        )
-
-            if matched_by:
-                meta = call.get("metaData", {})
-                matched_calls.append({
-                    "call_id": str(meta.get("id", "")),
-                    "title": meta.get("title", "Untitled"),
-                    "scheduled": meta.get("scheduled"),
-                    "duration": meta.get("duration", 0),
-                    "matched_by": matched_by,
-                    "matched_participants": matched_participants,
-                    "speaker_map": speaker_map,
-                    "parties": parties,
-                })
-
-        if not matched_calls:
-            return (
-                f"No calls found matching '{params.account_filter}' in the date range. "
-                f"Scanned {len(all_calls)} total calls. "
-                f"Try a broader filter (e.g., just the domain like 'acme.com') "
-                f"or check the account name spelling."
-            )
-
-        # ── Step 3: Retrieve transcripts ─────────────────────────────────
-        matched_call_ids = [c["call_id"] for c in matched_calls]
-
-        transcript_body: Dict[str, Any] = {
-            "filter": {
-                "fromDateTime": params.from_date_time,
-                "toDateTime": params.to_date_time,
-                "callIds": matched_call_ids,
-            }
+        semaphore = asyncio.Semaphore(RATE_LIMIT_CONCURRENT)
+        content_selector = {
+            "context": "Basic",
+            "exposedFields": {"parties": True},
         }
 
-        transcripts = await _paginated_post(
-            "calls/transcript", transcript_body, "callTranscripts"
-        )
+        async with httpx.AsyncClient() as client:
+            # ── Step 1: Concurrent discovery ──────────────────────────────
+            all_calls = await _discover_calls_concurrent(
+                client, from_date_time, to_date_time,
+                content_selector, semaphore,
+            )
 
-        # Build lookup: call_id -> raw transcript
+            if not all_calls:
+                return f"No calls found in the date range {from_date_time} to {to_date_time}."
+
+            # ── Step 2: Filter by account ─────────────────────────────────
+            account_filter_lower = account_filter.strip().lower()
+            matched_calls: List[Dict[str, Any]] = []
+
+            for call in all_calls:
+                matched_by = _matches_account(call, account_filter_lower)
+
+                if matched_by:
+                    speaker_map: Dict[str, Dict[str, str]] = {}
+                    parties = call.get("parties", [])
+                    for party in parties:
+                        sid = str(party.get("speakerId", ""))
+                        if sid:
+                            speaker_map[sid] = {
+                                "name": party.get("name", "Unknown"),
+                                "email": party.get("emailAddress", ""),
+                                "affiliation": party.get("affiliation", ""),
+                            }
+
+                    matched_participants = []
+                    if "participant" in matched_by:
+                        for party in parties:
+                            email = str(party.get("emailAddress") or "").lower()
+                            company = str(party.get("company") or "").lower()
+                            if account_filter_lower in email or account_filter_lower in company:
+                                display = party.get("name", party.get("emailAddress", "Unknown"))
+                                email_display = party.get("emailAddress", "")
+                                matched_participants.append(
+                                    f"{display} ({email_display})" if email_display else display
+                                )
+
+                    meta = call.get("metaData", {})
+                    matched_calls.append({
+                        "call_id": str(meta.get("id", "")),
+                        "title": meta.get("title", "Untitled"),
+                        "scheduled": meta.get("scheduled"),
+                        "duration": meta.get("duration", 0),
+                        "matched_by": matched_by,
+                        "matched_participants": matched_participants,
+                        "speaker_map": speaker_map,
+                        "parties": parties,
+                    })
+
+            if not matched_calls:
+                return (
+                    f"No calls found matching '{account_filter}' in the date range. "
+                    f"Scanned {len(all_calls)} total calls."
+                )
+
+            # ── Step 3: Retrieve transcripts ──────────────────────────────
+            matched_call_ids = [c["call_id"] for c in matched_calls]
+            transcript_body: Dict[str, Any] = {
+                "filter": {
+                    "fromDateTime": from_date_time,
+                    "toDateTime": to_date_time,
+                    "callIds": matched_call_ids,
+                }
+            }
+            transcripts = await _paginated_post(
+                "calls/transcript", transcript_body, "callTranscripts",
+                client=client, semaphore=semaphore,
+            )
+
+        # ── Step 4: Resolve speaker IDs ───────────────────────────────────
         transcript_map: Dict[str, Any] = {}
         for t in transcripts:
             transcript_map[str(t.get("callId", ""))] = t.get("transcript", [])
 
-        # ── Step 4: Resolve speaker IDs to names ────────────────────────
         for call in matched_calls:
             raw_transcript = transcript_map.get(call["call_id"], [])
             smap = call.get("speaker_map", {})
@@ -1331,16 +1104,16 @@ async def gong_export_account_transcripts(params: ExportAccountTranscriptsInput)
 
             call["resolved_transcript"] = resolved_transcript
 
-        # ── Step 5: Write files ──────────────────────────────────────────
-        base_dir = Path(params.output_dir).expanduser()
-        folder_name = _sanitize_filename(params.account_filter)
+        # ── Step 5: Write files ───────────────────────────────────────────
+        base_dir = Path(output_dir).expanduser()
+        folder_name = _sanitize_filename(account_filter.strip())
         output_path = base_dir / folder_name
         output_path.mkdir(parents=True, exist_ok=True)
 
         written_files: List[Dict[str, Any]] = []
         combined_lines: List[str] = [
-            f"# All Transcripts: {params.account_filter}",
-            f"Date range: {params.from_date_time} to {params.to_date_time}",
+            f"# All Transcripts: {account_filter}",
+            f"Date range: {from_date_time} to {to_date_time}",
             f"Total calls: {len(matched_calls)}",
             f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
             "",
@@ -1348,11 +1121,9 @@ async def gong_export_account_transcripts(params: ExportAccountTranscriptsInput)
             "",
         ]
 
-        # Sort calls by scheduled date
         matched_calls.sort(key=lambda c: c.get("scheduled") or "")
 
         for call in matched_calls:
-            # Build the markdown content for this call
             call_meta = {
                 "title": call["title"],
                 "call_id": call["call_id"],
@@ -1367,7 +1138,6 @@ async def gong_export_account_transcripts(params: ExportAccountTranscriptsInput)
                 call.get("parties", []),
             )
 
-            # Determine filename from date + title
             date_str = "undated"
             if call.get("scheduled"):
                 try:
@@ -1394,21 +1164,19 @@ async def gong_export_account_transcripts(params: ExportAccountTranscriptsInput)
                 "transcript_entries": len(call.get("resolved_transcript", [])),
             })
 
-            # Append to combined file
             combined_lines.append(content)
             combined_lines.extend(["", "---", ""])
 
-        # Write combined file
         combined_path = output_path / "_combined_transcripts.md"
         combined_content = "\n".join(combined_lines)
         combined_path.write_text(combined_content, encoding="utf-8")
 
-        # ── Step 6: Return summary ───────────────────────────────────────
+        # ── Step 6: Return summary ────────────────────────────────────────
         total_size = sum(f["size_bytes"] for f in written_files)
         total_entries = sum(f["transcript_entries"] for f in written_files)
 
         summary_lines = [
-            f"# Export Complete: {params.account_filter}",
+            f"# Export Complete: {account_filter}",
             "",
             f"- **Calls exported**: {len(written_files)}",
             f"- **Total calls scanned**: {len(all_calls)}",
@@ -1422,7 +1190,7 @@ async def gong_export_account_transcripts(params: ExportAccountTranscriptsInput)
 
         for f in written_files:
             summary_lines.append(
-                f"- **{f['title']}** ({f['date']}) - "
+                f"- **{f['title']}** ({f['date']}) — "
                 f"{f['transcript_entries']} entries, "
                 f"{f['size_bytes'] / 1024:.1f} KB"
             )
